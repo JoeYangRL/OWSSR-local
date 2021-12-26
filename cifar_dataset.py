@@ -7,7 +7,7 @@ from randaugment import RandAugmentMC
 from PIL import Image
 import logging
 import cv2
-
+from utils import load_image
 """
 # used args paramters
 args.num_labeled [check]
@@ -39,7 +39,29 @@ imagenet_cls_num = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
                  62, 69, 36, 61, 7, 63, 75, 5, 32, 4,
                  51, 48, 73, 93, 39, 67, 29, 49, 57, 33, 100]"""
 
-task_list = [i for i in range(101)]
+#task_list = [i for i in range(101)]
+
+task_list = [4, 30, 55, 72, 95,
+                 1, 32, 67, 73, 91,
+                 54, 62, 70, 82, 92,
+                 9, 10, 16, 28, 61,
+                 0, 51, 53, 57, 83,
+                 22, 39, 40, 86, 87,
+                 5, 20, 25, 84, 94,
+                 6, 7, 14, 18, 24,
+                 3, 42, 43, 88, 97,
+                 12, 17, 37, 68, 76,
+                 23, 33, 49, 60, 71,
+                 15, 19, 21, 31, 38,
+                 34, 63, 64, 66, 75,
+                 26, 45, 77, 79, 99,
+                 2, 11, 35, 46, 98,
+                 27, 29, 44, 78, 93,
+                 36, 50, 65, 74, 80,
+                 47, 52, 56, 59, 96,
+                 8, 13, 48, 58, 90,
+                 41, 69, 81, 85, 89,
+                 100] #cls order in superclass order
 
 class CIFAR100_txt():
     def __init__(self, root):
@@ -211,18 +233,19 @@ class MyDataset_labeled(Dataset):
                 """img = Image.open(sep[0])
                 if img.mode != 'RGB':
                     img = img.convert('RGB')"""
-                img = cv2.imread(sep[0])
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                self.data.append(img)
+                """img = cv2.imread(sep[0])
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)"""
+                self.data.append(sep[0])
                 self.label.append(int(task_list.index(int(sep[1])))) # origin label --> shuffled label
         
         f.close()
     
     def __getitem__(self, index):
 
-        img, label = self.data[index], self.label[index]
-        #img = self.transform(img)
-        img = self.transform(Image.fromarray(img))
+        path, label = self.data[index], self.label[index]
+        img = load_image(path)
+        img = self.transform(img)
+        #img = self.transform(Image.fromarray(img))
 
         return img, label
     
@@ -235,7 +258,7 @@ class MyDataset_unlabeled(Dataset):
         super(MyDataset_unlabeled,self).__init__()
         ##############################################################################
         # setup
-        f = open(os.path.join(args.save_root, 'cifar100_B%i_%isteps_%s' % (args.base_task_cls, args.steps, args.timestamp), 
+        f = open(os.path.join(args.save_root, 'cifar100_B%i_%isteps_%s' % (args.base_task_cls, args.steps, args.timestamp),
                 'train_%i_unlabeled.txt' % (args.now_step)), 'r')
         self.data_all = []
         self.label_all = []
@@ -253,9 +276,9 @@ class MyDataset_unlabeled(Dataset):
                 """img = Image.open(sep[0])
                 if img.mode != 'RGB':
                     img = img.convert('RGB')"""
-                img = cv2.imread(sep[0])
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                self.data_all.append(img)
+                """img = cv2.imread(sep[0])
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)"""
+                self.data_all.append(sep[0])
                 self.label_all.append(int(task_list.index(int(sep[1])))) # origin label --> shuffled label
         #self.init_index()
         f.close()
@@ -274,9 +297,10 @@ class MyDataset_unlabeled(Dataset):
 
     def __getitem__(self, index):
 
-        img, label = self.data_select[index], self.label_select[index]
-        #img = self.transform(img)
-        img = self.transform(Image.fromarray(img))
+        path, label = self.data_select[index], self.label_select[index]
+        img = load_image(path)
+        img = self.transform(img)
+        #img = self.transform(Image.fromarray(img))
 
         return img, label
     
@@ -309,9 +333,9 @@ class Mydataset_test(Dataset):
                     """img = Image.open(sep[0])
                     if img.mode != 'RGB':
                         img = img.convert('RGB')"""
-                    img = cv2.imread(sep[0])
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    self.data.append(img)
+                    """img = cv2.imread(sep[0])
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)"""
+                    self.data.append(sep[0])
                     self.label.append(int(task_list.index(int(sep[1])))) # origin label --> shuffled label
             f_test.close()
         else:
@@ -326,18 +350,19 @@ class Mydataset_test(Dataset):
                     """img = Image.open(sep[0])
                     if img.mode != 'RGB':
                         img = img.convert('RGB')"""
-                    img = cv2.imread(sep[0])
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    self.data.append(img)
+                    """img = cv2.imread(sep[0])
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)"""
+                    self.data.append(sep[0])
                     self.label.append(int(task_list.index(int(sep[1])))) # origin label --> shuffled label
         
             f_val.close()
 
     def __getitem__(self, index):
 
-        img, label = self.data[index], self.label[index]
-        #img = self.transform(img)
-        img = self.transform(Image.fromarray(img))
+        path, label = self.data[index], self.label[index]
+        img = load_image(path)
+        img = self.transform(img)
+        #img = self.transform(Image.fromarray(img))
 
         return img, label
     

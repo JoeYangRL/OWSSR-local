@@ -23,14 +23,12 @@ def ova_loss(logits_open, label):
     Lo = open_loss_neg + open_loss
     return Lo
 
-
 def ova_ent(logits_open):
     logits_open = logits_open.view(logits_open.size(0), 2, -1)
     logits_open = F.softmax(logits_open, 1)
     Le = torch.mean(torch.mean(torch.sum(-logits_open *
                                    torch.log(logits_open + 1e-8), 1), 1))
     return Le
-
 
 def dist_loss(args, logits_m, logits_open_m, logits_old, logits_open_old):
 
@@ -42,3 +40,5 @@ def dist_loss(args, logits_m, logits_open_m, logits_old, logits_open_old):
     loss2 = nn.KLDivLoss()(F.log_softmax(logits_open_m/args.T), F.softmax(logits_open_old/args.T)) * args.T * args.T
 
     return loss1+loss2
+    
+

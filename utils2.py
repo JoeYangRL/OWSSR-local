@@ -12,7 +12,7 @@ import torch.distributed as dist
 import os
 import shutil
 import logging
-from PIL import Image
+from copy import deepcopy
 """
 # used args paramters
 args.seed: 设置随机种子数 [check]
@@ -68,7 +68,7 @@ def set_models(args):
 
 def create_model(args):
     if 'wideresnet' in args.arch:
-        import wideresnet as models
+        import wideresnet2 as models
         if args.now_step > 1:
             if args.base_task_cls != 0:
                 num_cls = args.base_task_cls + (args.now_step-2) * ((100-args.base_task_cls) / (args.steps))
@@ -160,28 +160,24 @@ def select_memory(args, model, u_train_dataset, memory_dataset):
             data_time.update(time.time() - end)
 
             inputs = inputs.to(args.device)
-            outputs, outputs_open = model(inputs)
-            outputs, outputs_open = outputs[:-args.cls_per_step], outputs_open[:-2*args.cls_per_step]
-            outputs = F.softmax(outputs, 1)
-            out_open = F.softmax(outputs_open.view(outputs_open.size(0), 2, -1), 1)
-            tmp_range = torch.range(0, out_open.size(0) - 1).long().cuda()
-            pred_close = outputs.data.max(1)[1]
-            unk_score = out_open[tmp_range, 0, pred_close]
-            known_ind = unk_score < 0.5
+            outputs, _ = model(inputs)
+            #outputs = F.softmax(outputs, 1)
+            #TODO: 判断是否需要softmax，理论上cosine分类器是不需要softmax的
+            pred_score, _ = outputs.data.max(1)
+            known_ind = pred_score < 0.5 # 说明最大的output也小于0.5，是outlier
             if batch_idx == 0:
                 known_all = known_ind
             else:
                 known_all = torch.cat([known_all, known_ind], 0)
         test_loader.close()
     known_all = known_all.data.cpu().numpy()
-    memory_idx = np.where(known_all != 0)[0]
-    u_train_idx = np.where(known_all == 0)[0]
+    memory_idx = np.where(known_all == 0)[0]
+    u_train_idx = np.where(known_all != 0)[0]
     print("memory selected ratio %s"%( (len(memory_idx)/ len(known_all))))
     print("memory index selected:", len(memory_idx))
     print("total unlabeled data: ", len(known_all))
-    model.train()
     memory_dataset.set_index(memory_idx)
-    u_train_dataset.set_index(u_train_idx)
+    #u_train_dataset.set_index(u_train_idx)
 
 def split_u_dataset(args, model, u_train_dataset, memory_dataset, confirm_dataset):
 
@@ -208,15 +204,13 @@ def split_u_dataset(args, model, u_train_dataset, memory_dataset, confirm_datase
             data_time.update(time.time() - end)
 
             inputs = inputs.to(args.device)
-            outputs, outputs_open = model(inputs)
-            outputs = F.softmax(outputs, 1)
-            out_open = F.softmax(outputs_open.view(outputs_open.size(0), 2, -1), 1)
-            tmp_range = torch.range(0, out_open.size(0) - 1).long().cuda()
-            pred_close = outputs.data.max(1)[1] # [bsz] output: cls_id with max value
-            old_cls_list = pred_close < (model.num_classes-args.cls_per_step)
-            new_cls_list = pred_close >= (model.num_classes-args.cls_per_step)
-            unk_score = out_open[tmp_range, 0, pred_close]  
-            known_ind = unk_score < 0.5 # True/False list
+            outputs, _ = model(inputs)
+            #outputs = F.softmax(outputs, 1)
+            #TODO: 判断是否需要softmax，理论上cosine分类器是不需要softmax的
+            pred_score, pred_idx = outputs.data.max(1) # ([bsz], [bsz]) pred_score: output最大值；pred_idx：最大output索引号（类别）
+            old_cls_list = pred_idx < (model.num_classes-args.cls_per_step)
+            new_cls_list = pred_idx >= (model.num_classes-args.cls_per_step)
+            known_ind = pred_score < 0.5 # 说明最大的output也小于0.5，是outlier
             if batch_idx == 0:
                 confirm = (known_ind * new_cls_list)
                 memory = (known_ind * old_cls_list)
@@ -230,9 +224,9 @@ def split_u_dataset(args, model, u_train_dataset, memory_dataset, confirm_datase
     confirm_idx = np.where(confirm != 0)[0]
     all_idx = np.array([i for i in range(len(memory))])
     u_train_idx = np.setdiff1d(all_idx, memory_idx)
-    u_train_idx = np.setdiff1d(u_train_idx, confirm_idx)
+    #u_train_idx = np.setdiff1d(u_train_idx, confirm_idx)
 
-    if args.local_rank == 0:
+    if args.rank == 0:
         logger.info("memory selected ratio %s"%((len(memory_idx)/ len(memory))))
         logger.info("memory index selected:%s"%len(memory_idx))
         logger.info("confirm selected ratio %s"%((len(confirm_idx)/ len(memory))))
@@ -252,30 +246,28 @@ def select_confirm(args, model, u_train_dataset, confirm_dataset, memory_dataset
     """
     data_time = AverageMeter()
     end = time.time()
-    u_train_dataset.init_index()
+    confirm_dataset.init_index()
 
     ##############################################################################
     # sample memory
 
     test_loader = DataLoader(
-        u_train_dataset,
+        confirm_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         drop_last=False,
         shuffle=False)
     model.eval()
     with torch.no_grad():
-        for batch_idx, ((_, _, inputs), targets) in enumerate(test_loader):
+        for batch_idx, ((inputs, _, _), targets) in enumerate(test_loader):
             data_time.update(time.time() - end)
 
             inputs = inputs.to(args.device)
-            outputs, outputs_open = model(inputs)
-            outputs = F.softmax(outputs, 1)
-            out_open = F.softmax(outputs_open.view(outputs_open.size(0), 2, -1), 1)
-            tmp_range = torch.range(0, out_open.size(0) - 1).long().cuda()
-            pred_close = outputs.data.max(1)[1]
-            unk_score = out_open[tmp_range, 0, pred_close]
-            known_ind = unk_score < 0.5
+            outputs, _ = model(inputs)
+            #outputs = F.softmax(outputs, 1)
+            #TODO: 判断是否需要softmax，理论上cosine分类器是不需要softmax的
+            pred_score, _ = outputs.data.max(1)
+            known_ind = pred_score < 0.5 # 说明最大的output也小于0.5，是outlier
             if batch_idx == 0:
                 known_all = known_ind
             else:
@@ -287,7 +279,7 @@ def select_confirm(args, model, u_train_dataset, confirm_dataset, memory_dataset
         confirm_idx = np.setdiff1d(confirm_idx, memory_dataset.idx)
         u_train_idx = np.setdiff1d(u_train_idx, memory_dataset.idx)
     
-    if args.local_rank == 0:
+    if args.rank == 0:
         if memory_dataset != None:
             logger.info("memory selected ratio %s"%(len(memory_dataset.idx) / len(known_all)))
             logger.info("memory index selected:%s"%len(memory_dataset.idx))
@@ -313,6 +305,35 @@ def save_checkpoint(state, is_best, checkpoint, now_step, filename='checkpoint.p
         shutil.copyfile(filepath, os.path.join(checkpoint,
                                                'model_best_step%i.pth.tar'%(now_step)))
 
-def load_image(path):
+class ModelEMA(object):
+    def __init__(self, args, model, decay):
+        self.ema = deepcopy(model)
+        self.ema.to(args.device)
+        self.ema.eval()
+        self.decay = decay
+        self.ema_has_module = hasattr(self.ema, 'module')
+        self.param_keys = [k for k, _ in self.ema.named_parameters()]
+        self.buffer_keys = [k for k, _ in self.ema.named_buffers()]
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
 
-    return Image.open(path).convert('RGB')
+    def update(self, model):
+        needs_module = hasattr(model, 'module') and not self.ema_has_module
+        with torch.no_grad():
+            msd = model.state_dict()
+            esd = self.ema.state_dict()
+            for k in self.param_keys:
+                if needs_module:
+                    j = 'module.' + k
+                else:
+                    j = k
+                model_v = msd[j].detach()
+                ema_v = esd[k]
+                esd[k].copy_(ema_v * self.decay + (1. - self.decay) * model_v)
+
+            for k in self.buffer_keys:
+                if needs_module:
+                    j = 'module.' + k
+                else:
+                    j = k
+                esd[k].copy_(msd[j])

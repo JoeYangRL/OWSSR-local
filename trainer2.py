@@ -1,5 +1,4 @@
-import sys
-sys.path.append("..")
+
 import logging
 import time
 import copy
@@ -12,12 +11,12 @@ from cifar import TransformOpenMatch, cifar100_std, cifar100_mean, normal_mean, 
     create_train_task_openmatch, create_test_dataset
 from tqdm import tqdm
 from cifar_dataset import TransformFixMatch
-from utils import AverageMeter,\
+from utils2 import AverageMeter,\
     save_checkpoint, \
     reduce_tensor, select_memory, split_u_dataset, select_confirm
 
-from loss import ova_loss, ova_ent, dist_loss
-from test import test
+from loss2 import ova_loss, ova_ent, dist_loss
+from test2 import test
 
 
 """
@@ -37,7 +36,7 @@ logger = logging.getLogger(__name__)
 best_acc = 0
 best_acc_val = 0
 
-def train(args, model, old_model, optimizer, scheduler, rank):
+def train(args, model, old_model, ema_model, optimizer, scheduler, rank):
     
     global best_acc
     global best_acc_val
@@ -47,8 +46,6 @@ def train(args, model, old_model, optimizer, scheduler, rank):
     data_time = AverageMeter()
     losses = AverageMeter()
     losses_x = AverageMeter()
-    losses_o = AverageMeter()
-    losses_oem = AverageMeter()
     losses_socr = AverageMeter()
     losses_fix = AverageMeter()
     losses_dist = AverageMeter()
@@ -72,7 +69,8 @@ def train(args, model, old_model, optimizer, scheduler, rank):
     
     
     if (rank == 0) and (args.now_step > 1):
-        select_memory(args, model, u_train_dataset, memory_dataset)
+        select_memory(args, old_model, u_train_dataset, memory_dataset)
+        logger.info(f"memory dataset length: {memory_dataset.__len__()}")
     
     train_sampler = RandomSampler if args.world_size == 1 else DistributedSampler
     
@@ -96,10 +94,9 @@ def train(args, model, old_model, optimizer, scheduler, rank):
         logger.info("---------- start defining metrics -------------------")
     default_out = "Epoch: {now_epoch}/{epoch:4}. " \
                   "LR: {now_lr:.6f}. " \
-                  "Lab: {loss_x:.4f}. " \
-                  "Open: {loss_o:.4f}"
+                  "Lab: {loss_x:.4f}. " 
     output_args = vars(args)
-    default_out += " OEM  {loss_oem:.4f}"
+    #default_out += " OEM  {loss_oem:.4f}"
     default_out += " SOCR  {loss_socr:.4f}"
     default_out += " Fix  {loss_fix:.4f}"
     default_out += " Dist  {loss_dist:.4f}"
@@ -127,11 +124,23 @@ def train(args, model, old_model, optimizer, scheduler, rank):
         if (epoch >= args.start_fix) and (rank == 0):
             if args.now_step > 1:
                 if args.online_distill:
-                    split_u_dataset(args, model, u_train_dataset, memory_dataset, confirm_dataset)
+                    # reselect memory & confirmed data per epoch
+                    if args.use_ema:
+                        split_u_dataset(args, ema_model.ema, u_train_dataset, memory_dataset, confirm_dataset)
+                    else:
+                        split_u_dataset(args, model, u_train_dataset, memory_dataset, confirm_dataset)
                 else:
-                    select_confirm(args, model, u_train_dataset, confirm_dataset, memory_dataset)
+                    # select confirmed data and keep memory data excluded
+                    if args.use_ema:
+                        select_confirm(args, ema_model.ema, u_train_dataset, confirm_dataset, memory_dataset)
+                    else:
+                        select_confirm(args, model, u_train_dataset, confirm_dataset, memory_dataset)
             else:
-                select_confirm(args, model, u_train_dataset, confirm_dataset)
+                # select confirmed unlabeled data for step 1
+                if args.use_ema:
+                    select_confirm(args, ema_model.ema, u_train_dataset, confirm_dataset)
+                else:
+                    select_confirm(args, model, u_train_dataset, confirm_dataset)
         
         u_bsz = args.batch_size * args.mu_u
         c_bsz = args.batch_size * args.mu_c
@@ -176,13 +185,13 @@ def train(args, model, old_model, optimizer, scheduler, rank):
             # 1. labeled data
             # TransformOpenMatch
             try:
-                (_, l_x_weak, l_x), l_y = l_train_iter.__next__()
+                (_, l_x_weak, _), l_y = l_train_iter.__next__()
             except:
                 if args.world_size > 1:
                     l_epoch += 1
                     l_train_trainloader.sampler.set_epoch(l_epoch)
                 l_train_iter = l_train_trainloader.__iter__()
-                (_, l_x_weak, l_x), l_y = l_train_iter.__next__()
+                (_, l_x_weak, _), l_y = l_train_iter.__next__()
             
             # 2. rest unlabeled data
             # TransformOpenMatch
@@ -200,13 +209,13 @@ def train(args, model, old_model, optimizer, scheduler, rank):
             if epoch >= args.start_fix:
 
                 try:
-                    (_, c_x_weak, c_x_strong), _ = confirm_iter.__next__()
+                    (c_x_weak1, c_x_weak2, c_x_strong), _ = confirm_iter.__next__()
                 except:
                     if args.world_size > 1:
                         c_epoch += 1
                         confirm_trainloader.sampler.set_epoch(c_epoch)
                     confirm_iter = confirm_trainloader.__iter__()
-                    (_, c_x_weak, c_x_strong), _ = confirm_iter.__next__()
+                    (c_x_weak1, c_x_weak2, c_x_strong), _ = confirm_iter.__next__()
             
             # 4. memory data
             # TransformOpenMatch
@@ -221,12 +230,13 @@ def train(args, model, old_model, optimizer, scheduler, rank):
                     (_, m_x_weak, _), _ = memory_iter.__next__()
             
             # concat all the data (ORDER: labeled --> rest_unlabeled --> confirmed --> memory)
+            x_u = torch.cat([u_x_weak1, u_x_weak2], 0) # 2 * u_bsz
+            x_all = torch.cat([l_x_weak, x_u], 0) # l_bsz + 2*u_bsz
             if epoch >= args.start_fix:
-                x_all = torch.cat([l_x_weak, l_x, u_x_weak1, u_x_weak2, c_x_weak, c_x_strong], 0)
-            else:
-                x_all = torch.cat([l_x_weak, l_x, u_x_weak1, u_x_weak2], 0)
+                x_c = torch.cat([c_x_weak1, c_x_weak2, c_x_strong], 0) # 3*c_bsz
+                x_all = torch.cat([x_all, x_c], 0) # l_bsz + 2*u_bsz + 3*c_bsz
             if args.now_step > 1:
-                x_all = torch.cat([x_all, m_x_weak], 0) # l_bsz + 2*u_bsz + 2*c_bsz + m_bsz
+                x_all = torch.cat([x_all, m_x_weak], 0) # l_bsz + 2*u_bsz + 3*c_bsz + m_bsz
 
             data_time.update(time.time() - end)
 
@@ -235,29 +245,29 @@ def train(args, model, old_model, optimizer, scheduler, rank):
 
             ##############################################################################
             # Forward & computing loss
-            logits, logits_open = model(x_all) # logits: [bsz, num_cls]; logits_open: [bsz, 2*num_cls]
-
-            logits_open_u1, logits_open_u2 = logits_open[2*args.batch_size:2*args.batch_size+2*u_bsz].chunk(2)
-
+            logits, feature = model(x_all) # logits: [bsz, num_cls]; logits_open: [bsz, 2*num_cls]
+            
             # Loss for labeled samples
             Lx = F.cross_entropy(logits[:2*args.batch_size], l_y.repeat(2),reduction='mean')
-            Lo = ova_loss(logits_open[:2*args.batch_size], l_y.repeat(2))
 
             # Open-set entropy minimization
-            L_oem = ova_ent(logits_open_u1) / 2.
-            L_oem += ova_ent(logits_open_u2) / 2.
+            # no
 
             # Soft consistenty regularization
-            logits_open_u1 = logits_open_u1.view(logits_open_u1.size(0), 2, -1)
-            logits_open_u2 = logits_open_u2.view(logits_open_u2.size(0), 2, -1)
-            logits_open_u1 = F.softmax(logits_open_u1, 1)
-            logits_open_u2 = F.softmax(logits_open_u2, 1)
+
+            logits_u1, logits_u2 = logits[2*args.batch_size:2*args.batch_size+2*u_bsz].chunk(2)
+            logits_u1 = F.softmax(logits_u1, 1)
+            logits_u2 = F.softmax(logits_u2, 1)
             L_socr = torch.mean(torch.sum(torch.sum(torch.abs(
-                logits_open_u1 - logits_open_u2)**2, 1), 1))
+                logits_u1 - logits_u2)**2, 1)))
+            if epoch < 10: 
+                lambda_socr = 0
+            else:
+                lambda_socr = args.lambda_socr
 
             # FixMatch loss
             if epoch >= args.start_fix:
-                logits_u_w, logits_u_s = logits[2*args.batch_size+2*u_bsz:2*args.batch_size+2*u_bsz+2*c_bsz].chunk(2)
+                logits_u_w, logits_u_s = logits[args.batch_size+2*u_bsz+c_bsz:args.batch_size+2*u_bsz+3*c_bsz].chunk(2)
                 pseudo_label = torch.softmax(logits_u_w/args.T, dim=-1).to(args.device)
                 max_probs, targets_u = torch.max(pseudo_label, dim=-1)
                 mask = max_probs.ge(args.threshold).to(args.device).float()
@@ -270,38 +280,39 @@ def train(args, model, old_model, optimizer, scheduler, rank):
             
             # diatillation loss
             if args.now_step > 1:
-                logits_old, logits_open_old = old_model(m_x_weak)
-                logits_m, logits_open_m = logits[-m_bsz:], logits_open[-2*m_bsz:]
-                L_dist = dist_loss(args, logits_m, logits_open_m, logits_old, logits_open_old)
+                logits_old, feature_old = old_model(m_x_weak)
+                
             else:
                 L_dist = torch.zeros(1).to(args.device).mean()
-
-            loss = Lx + args.lambda_o * Lo + args.lambda_oem * L_oem + args.lambda_socr * L_socr + L_fix + args.lambda_dist * L_dist
+            
+            loss = Lx + lambda_socr * L_socr + L_fix + args.lambda_dist * L_dist
             loss.backward()
 
             #同步多卡上的结果
-            reduce_loss = loss.data
-            reduce_Lx = Lx.data
-            reduce_Lo = Lo.data
-            reduce_L_oem = L_oem.data
-            reduce_L_socr = L_socr.data
-            reduce_L_fix = L_fix.data
-            reduce_L_dist = L_dist.data
+            if args.world_size > 1:
+                reduce_loss = reduce_tensor(loss.data)
+                reduce_Lx = reduce_tensor(Lx.data)
+                reduce_L_socr = reduce_tensor(L_socr.data)
+                reduce_L_fix = reduce_tensor(L_fix.data)
+                reduce_L_dist = reduce_tensor(L_dist.data)
+            else:
+                reduce_loss = loss.data
+                reduce_Lx = Lx.data
+                reduce_L_socr = L_socr.data
+                reduce_L_fix = L_fix.data
+                reduce_L_dist = L_dist.data
             
             # avgmeter更新数据
             losses.update(reduce_loss.item())
             losses_x.update(reduce_Lx.item())
-            losses_o.update(reduce_Lo.item())
-            losses_oem.update(reduce_L_oem.item())
             losses_socr.update(reduce_L_socr.item())
             losses_fix.update(reduce_L_fix.item())
             losses_dist.update(reduce_L_dist.item())
 
             #将最新的平均值传入output
             output_args["batch"] = batch_idx
+            output_args["loss"] = losses.avg
             output_args["loss_x"] = losses_x.avg
-            output_args["loss_o"] = losses_o.avg
-            output_args["loss_oem"] = losses_oem.avg
             output_args["loss_socr"] = losses_socr.avg
             output_args["loss_fix"] = losses_fix.avg
             output_args["loss_dist"] = losses_dist.avg
@@ -321,7 +332,7 @@ def train(args, model, old_model, optimizer, scheduler, rank):
             p_bar.close()
         
 
-        if (rank == 0):
+        if rank == 0:
 
             valid_loader = DataLoader(
             valid_dataset,
@@ -335,15 +346,13 @@ def train(args, model, old_model, optimizer, scheduler, rank):
             drop_last=False)
             #val_acc = test(args, valid_loader, model, val=True)
             test_loss, test_acc_close, test_overall, \
-            test_unk, test_roc, test_roc_softm, test_id \
+            test_unk, test_roc, test_roc_softm \
                 = test(args, test_loader, model)
 
             """
-            # disable SummaryWriter
+            # disable summarywriter
             args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
             args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
-            args.writer.add_scalar('train/3.train_loss_o', losses_o.avg, epoch)
-            args.writer.add_scalar('train/4.train_loss_oem', losses_oem.avg, epoch)
             args.writer.add_scalar('train/5.train_loss_socr', losses_socr.avg, epoch)
             args.writer.add_scalar('train/6.train_loss_fix', losses_fix.avg, epoch)
             args.writer.add_scalar('train/7.train_loss_dist', losses_dist.avg, epoch)
@@ -384,6 +393,6 @@ def train(args, model, old_model, optimizer, scheduler, rank):
             scheduler.step()
 
     """
-    # disable SummaryWriter
+    # disable summarywriter
     if rank == 0:
         args.writer.close()"""

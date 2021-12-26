@@ -36,6 +36,8 @@ def set_parser():
                         help='mu for m_bsz')
     parser.add_argument('--lambda_oem', default=0.1, type=float,
                         help='weight for open enrtopy min loss')
+    parser.add_argument('--lambda_o', default=1.0, type=float,
+                        help='weight for labeled open classifier loss')
     parser.add_argument('--lambda_socr', default=0.5, type=float,
                         help='weight for open consistency regularization loss')
     parser.add_argument('--lambda_dist', default=1.0, type=float,
@@ -85,6 +87,10 @@ def set_parser():
                         help='iters per epoch')
     parser.add_argument('--threshold', default=0.95, type=float,
                         help='threshold to choose confident samples in FixMatch')
+    parser.add_argument('--use-ema', action='store_true', default=False,
+                        help='use EMA model')
+    parser.add_argument('--ema-decay', default=0.999, type=float,
+                        help='EMA decay rate')
     
     args = parser.parse_args()
     return args
